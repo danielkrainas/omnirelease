@@ -1,0 +1,22 @@
+services:
+  omnirelease:
+    build: .
+    image: omnirelease:latest
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      OMNIRELEASE_REPOSITORIES: "cli/cli,sharkdp/bat"
+      # One combined repository at /acme/ (groups separated by ';'):
+      # OMNIRELEASE_GROUPS: "acme=acme/acme-apps,acme/acme-core"
+      # OMNIRELEASE_BASE_URL: "https://pkg.example.com"
+      # GITHUB_TOKEN: "${GITHUB_TOKEN}"
+      # Create the key first: docker compose run --rm omnirelease keygen --out /etc/omnirelease/signing-key.asc
+      OMNIRELEASE_SIGNING_KEY_FILE: /etc/omnirelease/signing-key.asc
+    volumes:
+      - omnirelease-keys:/etc/omnirelease
+      - omnirelease-cache:/var/cache/omnirelease
+
+volumes:
+  omnirelease-keys:
+  omnirelease-cache:

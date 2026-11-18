@@ -1,0 +1,62 @@
+# omnirelease configuration. Every setting can also be given as a CLI flag or an
+# OMNIRELEASE_* environment variable (see `omnirelease --help`); those take precedence.
+
+# Address and port to listen on.
+listen = "0.0.0.0:8080"
+
+# Public URL clients use to reach this server. Used in the setup instructions and .repo
+# files. When unset it is derived from the Host / X-Forwarded-* request headers.
+# base_url = "https://pkg.example.com"
+
+# Where parsed package metadata is cached (a few KiB per package).
+cache_dir = "./cache"
+
+# Which GitHub repositories may be served:
+#   "owner/repo"  a single repository
+#   "owner/*"     every repository of a user or organization
+#   "*/*"         any public repository (open proxy; use with care)
+repositories = [
+  "cli/cli",
+  "sharkdp/bat",
+]
+
+# GitHub API token. Optional, but raises the rate limit from 60 to 5000 requests/hour.
+# Prefer the GITHUB_TOKEN environment variable over putting it here.
+# github_token = "ghp_..."
+
+# GitHub API base URL (change for GitHub Enterprise Server: https://ghe.example.com/api/v3).
+github_api = "https://api.github.com"
+
+# How often to check GitHub for new releases. Stale indexes are served while refreshing.
+refresh_interval = "15m"
+
+# How many of the most recent releases to index per repository.
+max_releases = 10
+
+# Whether GitHub pre-releases are included.
+include_prereleases = false
+
+# "redirect": answer package downloads with a 302 to GitHub (default, uses no bandwidth).
+# "proxy":    stream package downloads through this server.
+download_mode = "redirect"
+
+# Max package assets inspected concurrently while indexing.
+index_concurrency = 4
+
+# Origin field written into APT Release files.
+origin = "omnirelease"
+
+# Groups: several GitHub repositories served as ONE combined repository at /<name>/,
+# so users add a single apt/dnf/pacman source for all of them. Members must be exact
+# owner/repo names (no wildcards) and do not need to be listed in `repositories` above.
+# With --group / OMNIRELEASE_GROUPS: "acme=acme/acme-apps,acme/acme-core;tools=a/b,c/d"
+#
+# [groups.acme]
+# repositories = ["acme/acme-apps", "acme/acme-core"]
+
+[signing]
+# ASCII-armored OpenPGP secret key used to sign repository metadata
+# (APT InRelease/Release.gpg, RPM repomd.xml.asc, pacman .db.sig).
+# Generate one with `omnirelease keygen`. When unset, metadata is unsigned.
+# key_file = "/etc/omnirelease/signing-key.asc"
+# passphrase = ""   # or OMNIRELEASE_SIGNING_KEY_PASSPHRASE
