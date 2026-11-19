@@ -1,5 +1,6 @@
 #![allow(clippy::large_enum_variant, clippy::result_large_err)]
 
+mod cache;
 mod config;
 mod github;
 mod index;
@@ -115,7 +116,7 @@ async fn serve(cfg: Config) -> Result<()> {
     };
 
     let listen = cfg.listen.clone();
-    let repos = repos::Repos::new(Arc::new(cfg), signer)?;
+    let repos = repos::Repos::new(Arc::new(cfg), signer).await?;
     repos.warm();
 
     let listener = tokio::net::TcpListener::bind(&listen)

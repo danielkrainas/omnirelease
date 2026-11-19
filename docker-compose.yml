@@ -13,10 +13,21 @@ services:
       # GITHUB_TOKEN: "${GITHUB_TOKEN}"
       # Create the key first: docker compose run --rm omnirelease keygen --out /etc/omnirelease/signing-key.asc
       OMNIRELEASE_SIGNING_KEY_FILE: /etc/omnirelease/signing-key.asc
+      # Optional shared cache (uncomment the redis service below too):
+      # OMNIRELEASE_REDIS_URL: "redis://redis:6379"
     volumes:
       - omnirelease-keys:/etc/omnirelease
       - omnirelease-cache:/var/cache/omnirelease
+    # depends_on: [redis]
+
+  # redis:
+  #   image: redis:7-alpine
+  #   restart: unless-stopped
+  #   command: ["redis-server", "--save", "60", "1"]
+  #   volumes:
+  #     - redis-data:/data
 
 volumes:
   omnirelease-keys:
   omnirelease-cache:
+  # redis-data:

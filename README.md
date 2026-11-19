@@ -124,6 +124,9 @@ overridden by command-line flags or environment variables. All options are docum
 | `signing.key_file`    | `--signing-key-file` / `OMNIRELEASE_SIGNING_KEY_FILE`            | *(unsigned)*             |
 | `signing.passphrase`  | `--signing-key-passphrase` / `OMNIRELEASE_SIGNING_KEY_PASSPHRASE`| *(none)*                 |
 | `groups`              | `--group` (repeatable) / `OMNIRELEASE_GROUPS` (`;`-separated)    | *(none)*                 |
+| `redis.url`           | `--redis-url` / `OMNIRELEASE_REDIS_URL`                          | *(memory and disk)*      |
+| `redis.prefix`        | `--redis-prefix` / `OMNIRELEASE_REDIS_PREFIX`                    | `omnirelease:`           |
+| `redis.ttl`           | `--redis-ttl` / `OMNIRELEASE_REDIS_TTL`                          | `30d`                    |
 
 **Repository patterns.** `owner/repo` allows a single repository, `owner/*` allows every
 repository of a user or organization, and `*/*` turns the server into an open proxy for
@@ -173,6 +176,42 @@ set `GITHUB_TOKEN`; a fine-grained token with no extra permissions is enough for
 repositories.
 
 **Logging.** Set `RUST_LOG`, for example `RUST_LOG=omnirelease=debug`.
+
+### Redis cache (optional)
+
+By default the GitHub release lists (and their ETags) are kept in memory and parsed
+package metadata is written to `cache_dir`. Each repository's index is rebuilt after a
+restart, which costs one GitHub API call per repository but no package downloads.
+
+Set `redis.url` to keep all of it in Redis (or a compatible server such as Valkey)
+instead:
+
+```sh
+omnirelease --redis-url redis://:password@localhost:6379/0 --repositories cli/cli serve
+```
+
+Three kinds of key are stored, all under `redis.prefix`. Each value is zstd-compressed
+JSON, and expires after `redis.ttl`. The expiry is renewed whenever a value changes.
+
+| Key                         | Contents                                                     |
+| --------------------------- | ------------------------------------------------------------ |
+| `v1:releases:<owner>/<repo>` | The last release list fetched from GitHub, with its ETag     |
+| `v1:repo:<owner>/<repo>`     | The indexed packages built from that list                    |
+| `v1:asset:<id>-<hash>`       | The parsed metadata of one package file (or why it failed)   |
+
+This gives you:
+
+- **Instant restarts.** Repositories are served from Redis straight away, and are then
+  checked against GitHub in the background.
+- **Replicas.** Several instances behind a load balancer share release lists, ETags and
+  parsed packages, so each package file is inspected once in total, not once per
+  instance. A shared ETag also lets most refreshes end in a free `304`.
+- **No disk state.** `cache_dir` is not used.
+
+omnirelease refuses to start if it cannot reach Redis, so a mistyped URL is noticed.
+After startup Redis is treated as a cache only. If it becomes unavailable, requests are
+still answered from memory and errors are logged. Package files are inspected again while
+Redis is down, and the client reconnects when it is back. Use `rediss://` for TLS.
 
 ### Signing keys
 
@@ -280,8 +319,9 @@ same name, install from this one explicitly, for example `pacman -S bat/bat`.
   `Host`, `X-Forwarded-Host` and `X-Forwarded-Proto` headers.
 - **Caching.** Metadata responses carry `Cache-Control: max-age=60`, so a CDN in front of
   the server works well.
-- **State.** The only state is the metadata cache in `cache_dir`. It is safe to delete,
-  and is rebuilt on demand.
+- **State.** The only state is the metadata cache in `cache_dir`, or in Redis when
+  configured (see [Redis cache](#redis-cache-optional)). Either is safe to delete, and is
+  rebuilt on demand.
 - **Many releases.** By default the 10 newest non-draft, non-pre-release releases are
   indexed (`max_releases`). apt and dnf see every version, so users can pin or downgrade.
   pacman sees the newest version of each package.

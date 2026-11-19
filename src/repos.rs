@@ -1,21 +1,20 @@
-//! Per-repository snapshot cache: fetches releases, downloads and parses new package assets
-//! (results are cached on disk by asset id), and rebuilds indexes in the background.
+//! Per-repository snapshots: fetches releases, downloads and parses new package assets
+//! (results are cached by asset id, see `cache`), and rebuilds indexes in the background.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
 use base64::Engine as _;
 use futures_util::{StreamExt, TryStreamExt};
-use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, RwLock};
 use tokio_util::io::{StreamReader, SyncIoBridge};
 
+use crate::cache::{Cache, CachedAsset, RepoState};
 use crate::config::Config;
-use crate::github::{Asset, Fetch, GitHub};
+use crate::github::{Asset, GitHub, Releases};
 use crate::index::Snapshot;
 use crate::pkg::{self, Kind, Meta, Package};
 use crate::signing::Signer;
@@ -27,6 +26,7 @@ pub struct Repos {
     pub cfg: Arc<Config>,
     pub signer: Option<Arc<Signer>>,
     gh: GitHub,
+    cache: Arc<Cache>,
     entries: StdMutex<HashMap<String, Arc<Entry>>>,
     /// Group name -> (member snapshots it was built from, combined snapshot). Holding the
     /// member Arcs keeps `Arc::ptr_eq` comparisons sound.
@@ -40,28 +40,28 @@ struct Entry {
     snapshot: RwLock<Option<Arc<Snapshot>>>,
     refresh_lock: Arc<Mutex<()>>,
     last_check: StdMutex<Option<Instant>>,
-}
-
-/// What we persist per asset, so each asset is downloaded and parsed at most once.
-#[derive(Serialize, Deserialize)]
-enum Cached {
-    Ok(Package),
-    Failed(String),
+    /// ETag of the release list the snapshot was built from.
+    built_etag: StdMutex<Option<String>>,
 }
 
 impl Repos {
-    pub fn new(cfg: Arc<Config>, signer: Option<Arc<Signer>>) -> Result<Arc<Self>> {
-        std::fs::create_dir_all(cfg.cache_dir.join("meta"))
-            .with_context(|| format!("creating cache dir {}", cfg.cache_dir.display()))?;
+    pub async fn new(cfg: Arc<Config>, signer: Option<Arc<Signer>>) -> Result<Arc<Self>> {
+        let cache = Arc::new(Cache::new(&cfg).await?);
         let http = reqwest::Client::builder()
             .user_agent(concat!("omnirelease/", env!("CARGO_PKG_VERSION")))
             .connect_timeout(std::time::Duration::from_secs(15))
             .build()?;
-        let gh = GitHub::new(http, &cfg.github_api, cfg.github_token.clone());
+        let gh = GitHub::new(
+            http,
+            &cfg.github_api,
+            cfg.github_token.clone(),
+            cache.clone(),
+        );
         Ok(Arc::new(Self {
             cfg,
             signer,
             gh,
+            cache,
             entries: StdMutex::new(HashMap::new()),
             groups: StdMutex::new(HashMap::new()),
         }))
@@ -109,6 +109,11 @@ impl Repos {
         let _guard = entry.refresh_lock.lock().await;
         if let Some(snap) = entry.snapshot.read().await.clone() {
             return Ok(snap); // someone else built it while we waited
+        }
+        // A package set cached by an earlier run or another replica can be served at once;
+        // it is left unchecked, so the next request triggers a background refresh.
+        if let Some(snap) = self.restore(owner, repo, &entry).await {
+            return Ok(snap);
         }
         self.refresh(owner, repo, &entry).await
     }
@@ -205,23 +210,58 @@ impl Repos {
         }
     }
 
+    async fn restore(&self, owner: &str, repo: &str, entry: &Entry) -> Option<Arc<Snapshot>> {
+        let key = repo_key(owner, repo);
+        let state = self.cache.repo_state(&key).await?;
+        if state.max_releases != self.cfg.max_releases
+            || state.include_prereleases != self.cfg.include_prereleases
+        {
+            return None;
+        }
+        let snap = match self.build(owner, repo, state.packages, state.arch_sigs) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!("{key}: could not rebuild cached index: {e:#}");
+                return None;
+            }
+        };
+        let (d, r, a) = snap.counts();
+        tracing::info!("restored {key} from cache: {d} deb, {r} rpm, {a} arch packages");
+        *entry.built_etag.lock().unwrap() = Some(state.etag);
+        *entry.snapshot.write().await = Some(snap.clone());
+        Some(snap)
+    }
+
+    fn build(
+        &self,
+        owner: &str,
+        repo: &str,
+        packages: Vec<Package>,
+        sigs: Vec<(String, String)>,
+    ) -> Result<Arc<Snapshot>> {
+        let mut snap =
+            Snapshot::build(&format!("{owner}/{repo}"), &self.cfg.origin, packages, sigs)?;
+        if let Some(signer) = &self.signer {
+            snap.sign_static(signer)?;
+        }
+        Ok(Arc::new(snap))
+    }
+
     async fn refresh(&self, owner: &str, repo: &str, entry: &Entry) -> Result<Arc<Snapshot>> {
         let started = Instant::now();
         let fetched = self.gh.releases(owner, repo).await;
         // Record the attempt even on failure so we don't hammer GitHub.
         *entry.last_check.lock().unwrap() = Some(Instant::now());
+        let Releases {
+            etag,
+            list: releases,
+        } = fetched?;
 
-        let releases = match fetched? {
-            Fetch::NotModified => {
-                if let Some(s) = entry.snapshot.read().await.clone() {
-                    tracing::debug!("{owner}/{repo}: not modified");
-                    return Ok(s);
-                }
-                // Lost our snapshot somehow; force a full fetch next time.
-                bail!("GitHub returned 304 but no snapshot is cached");
-            }
-            Fetch::Changed(r) => r,
-        };
+        let unchanged = etag.is_some() && *entry.built_etag.lock().unwrap() == etag;
+        if unchanged && let Some(s) = entry.snapshot.read().await.clone() {
+            tracing::debug!("{owner}/{repo}: not modified");
+            return Ok(s);
+        }
 
         let mut jobs = Vec::new();
         let mut sigs: Vec<(String, String)> = Vec::new();
@@ -265,34 +305,30 @@ impl Repos {
             .collect()
             .await;
 
-        let mut snap =
-            Snapshot::build(&format!("{owner}/{repo}"), &self.cfg.origin, packages, sigs)?;
-        if let Some(signer) = &self.signer {
-            snap.sign_static(signer)?;
-        }
+        let snap = self.build(owner, repo, packages, sigs)?;
         let (d, r, a) = snap.counts();
         tracing::info!(
             "indexed {owner}/{repo}: {d} deb, {r} rpm, {a} arch packages in {:.1?}",
             started.elapsed()
         );
-        let snap = Arc::new(snap);
+        if let Some(etag) = &etag {
+            let state = RepoState {
+                etag: etag.clone(),
+                max_releases: self.cfg.max_releases,
+                include_prereleases: self.cfg.include_prereleases,
+                packages: snap.packages.clone(),
+                arch_sigs: snap.arch_sigs.clone(),
+            };
+            self.cache
+                .put_repo_state(&repo_key(owner, repo), &state)
+                .await;
+        }
+        *entry.built_etag.lock().unwrap() = etag;
         *entry.snapshot.write().await = Some(snap.clone());
         Ok(snap)
     }
 
-    fn cache_path(&self, asset: &Asset) -> PathBuf {
-        let mut h = Sha256::new();
-        h.update(asset.updated_at.as_bytes());
-        h.update(asset.size.to_le_bytes());
-        h.update(asset.browser_download_url.as_bytes());
-        let tag = &hex::encode(h.finalize())[..16];
-        self.cfg
-            .cache_dir
-            .join("meta")
-            .join(format!("{}-{tag}.json", asset.id))
-    }
-
-    /// Metadata for one asset, from the disk cache or by downloading and parsing it.
+    /// Metadata for one asset, from the cache or by downloading and parsing it.
     async fn package(
         &self,
         tag: &str,
@@ -300,13 +336,10 @@ impl Repos {
         kind: Kind,
         sig: Option<&Asset>,
     ) -> Result<Package> {
-        let cache = self.cache_path(asset);
-        if let Ok(raw) = tokio::fs::read(&cache).await {
-            match serde_json::from_slice::<Cached>(&raw) {
-                Ok(Cached::Ok(p)) => return Ok(p),
-                Ok(Cached::Failed(e)) => bail!("{e} (cached)"),
-                Err(_) => {} // corrupt or old format: rebuild
-            }
+        match self.cache.asset(asset).await {
+            Some(CachedAsset::Ok(p)) => return Ok(p),
+            Some(CachedAsset::Failed(e)) => bail!("{e} (cached)"),
+            None => {}
         }
 
         tracing::info!(
@@ -316,15 +349,15 @@ impl Repos {
         );
         let result = self.download_and_parse(tag, asset, kind, sig).await;
         let cached = match &result {
-            Ok(p) => Some(Cached::Ok(p.clone())),
+            Ok(p) => Some(CachedAsset::Ok(p.clone())),
             // Only remember parse failures, not transient network errors.
-            Err(e) if e.to_string().starts_with("parse:") => Some(Cached::Failed(format!("{e:#}"))),
+            Err(e) if e.to_string().starts_with("parse:") => {
+                Some(CachedAsset::Failed(format!("{e:#}")))
+            }
             Err(_) => None,
         };
         if let Some(c) = cached {
-            let tmp = cache.with_extension("json.tmp");
-            tokio::fs::write(&tmp, serde_json::to_vec(&c)?).await?;
-            tokio::fs::rename(&tmp, &cache).await?;
+            self.cache.put_asset(asset, &c).await?;
         }
         result
     }
@@ -409,6 +442,10 @@ impl Repos {
             source: None,
         })
     }
+}
+
+fn repo_key(owner: &str, repo: &str) -> String {
+    format!("{owner}/{repo}").to_ascii_lowercase()
 }
 
 /// Hashes and counts everything read through it, and remembers transport errors.

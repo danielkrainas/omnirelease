@@ -12,7 +12,7 @@ use serde::Deserialize;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "lowercase")]
 pub enum DownloadMode {
-    /// Respond with a 302 redirect to the GitHub asset URL (default, cheapest).
+    /// Respond with a redirect to the GitHub asset URL (default, cheapest).
     Redirect,
     /// Stream the asset through this server.
     Proxy,
@@ -75,6 +75,21 @@ pub struct Overrides {
     /// groups with `;`. Overrides a config-file group of the same name.
     #[arg(long = "group", env = "OMNIRELEASE_GROUPS", value_delimiter = ';')]
     pub groups: Option<Vec<String>>,
+
+    /// Redis URL (`redis://[:password@]host:port[/db]`, or `rediss://` for TLS). When set,
+    /// release lists, indexed packages and parsed metadata are cached in Redis instead of
+    /// memory and `--cache-dir`, so restarts and replicas share them.
+    #[arg(long, env = "OMNIRELEASE_REDIS_URL", hide_env_values = true)]
+    pub redis_url: Option<String>,
+
+    /// Prefix for all Redis keys.
+    #[arg(long, env = "OMNIRELEASE_REDIS_PREFIX")]
+    pub redis_prefix: Option<String>,
+
+    /// Expiry for Redis entries (e.g. `30d`; `0s` for none). Entries are rewritten when
+    /// their contents change.
+    #[arg(long, env = "OMNIRELEASE_REDIS_TTL", value_parser = humantime::parse_duration)]
+    pub redis_ttl: Option<Duration>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -98,6 +113,27 @@ pub struct Config {
     pub signing: Signing,
     /// Named groups of repositories served as one combined repository at `/<name>/`.
     pub groups: BTreeMap<String, Group>,
+    pub redis: RedisConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RedisConfig {
+    /// Unset: cache in memory and on disk.
+    pub url: Option<String>,
+    pub prefix: String,
+    #[serde(with = "humantime_serde")]
+    pub ttl: Duration,
+}
+
+impl Default for RedisConfig {
+    fn default() -> Self {
+        Self {
+            url: None,
+            prefix: "omnirelease:".into(),
+            ttl: Duration::from_secs(30 * 24 * 60 * 60),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -135,6 +171,7 @@ impl Default for Config {
             origin: "omnirelease".into(),
             signing: Signing::default(),
             groups: BTreeMap::new(),
+            redis: RedisConfig::default(),
         }
     }
 }
@@ -183,6 +220,20 @@ impl Config {
         if let Some(v) = o.signing_key_passphrase {
             cfg.signing.passphrase = Some(v);
         }
+        if let Some(v) = o.redis_url {
+            cfg.redis.url = Some(v);
+        }
+        if let Some(v) = o.redis_prefix {
+            cfg.redis.prefix = v;
+        }
+        if let Some(v) = o.redis_ttl {
+            cfg.redis.ttl = v;
+        }
+        cfg.redis.url = cfg
+            .redis
+            .url
+            .map(|u| u.trim().to_string())
+            .filter(|u| !u.is_empty());
         for spec in o.groups.unwrap_or_default() {
             let spec = spec.trim();
             if spec.is_empty() {

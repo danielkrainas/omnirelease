@@ -8,7 +8,8 @@ listen = "0.0.0.0:8080"
 # files. When unset it is derived from the Host / X-Forwarded-* request headers.
 # base_url = "https://pkg.example.com"
 
-# Where parsed package metadata is cached (a few KiB per package).
+# Where parsed package metadata is cached (a few KiB per package). Unused when Redis is
+# configured below.
 cache_dir = "./cache"
 
 # Which GitHub repositories may be served:
@@ -36,7 +37,7 @@ max_releases = 10
 # Whether GitHub pre-releases are included.
 include_prereleases = false
 
-# "redirect": answer package downloads with a 302 to GitHub (default, uses no bandwidth).
+# "redirect": answer package downloads with a redirect to GitHub (default, uses no bandwidth).
 # "proxy":    stream package downloads through this server.
 download_mode = "redirect"
 
@@ -53,6 +54,17 @@ origin = "omnirelease"
 #
 # [groups.acme]
 # repositories = ["acme/acme-apps", "acme/acme-core"]
+
+[redis]
+# Optional. When set, GitHub release lists (with ETags), each repository's indexed
+# packages and parsed package metadata are cached in Redis (or Valkey, KeyDB, …) instead
+# of in memory and cache_dir. Restarts then serve immediately without re-indexing, and
+# several replicas share one cache. rediss:// enables TLS.
+# url = "redis://:password@localhost:6379/0"   # or OMNIRELEASE_REDIS_URL
+# Prefix for every key, to share one Redis with other applications or instances.
+# prefix = "omnirelease:"
+# Expiry for cached entries ("0s" for none). Entries are rewritten whenever they change.
+# ttl = "30d"
 
 [signing]
 # ASCII-armored OpenPGP secret key used to sign repository metadata
